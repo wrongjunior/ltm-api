@@ -2,9 +2,10 @@ package api
 
 import (
 	"encoding/json"
-	"io"
 	"ltm-api/estimator"
 	"net/http"
+	"os"
+	_ "strconv"
 )
 
 // EstimateReadingTime обрабатывает запрос на оценку времени чтения текста
@@ -43,15 +44,25 @@ func EstimateFromFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Читаем содержимое файла
-	fileContent, err := io.ReadAll(file)
+	// Сохраняем файл временно на диск
+	tempFile, err := os.CreateTemp("", "upload-*.txt")
 	if err != nil {
-		http.Error(w, "Error reading file", http.StatusInternalServerError)
+		http.Error(w, "Unable to create temp file", http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(tempFile.Name())
+
+	// Записываем файл на диск
+	_, err = tempFile.ReadFrom(file)
+	if err != nil {
+		http.Error(w, "Unable to save file", http.StatusInternalServerError)
 		return
 	}
 
-	// Используем стандартную скорость чтения и параметры
-	result, err := estimator.EstimateReadingTimeParallel(string(fileContent), 200, false, 4)
+	tempFile.Close()
+
+	// Используем новый метод потоковой обработки текста
+	result, err := estimator.StreamProcessFile(tempFile.Name(), 200, false, 4)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
