@@ -3,6 +3,7 @@ package estimator
 import (
 	"bufio"
 	"errors"
+	"log"
 	"math"
 	"os"
 	"regexp"
@@ -15,10 +16,9 @@ var (
 	russianVowels    = "аеёиоуыэюя"
 	englishVowels    = "aeiouy"
 	wordRegex        = regexp.MustCompile(`[\p{L}\p{N}]+(-[\p{L}\p{N}]+)*`)
-	sentenceEndRegex = regexp.MustCompile(`[.!?]+`)
+	sentenceEndRegex = regexp.MustCompile(`[.!?]+\s*`)
 )
 
-// содержит результаты анализа текста
 type Result struct {
 	ReadingTime        float64
 	WordCount          int
@@ -62,31 +62,24 @@ func CountSyllables(word string) int {
 		charIsVowel := strings.ContainsRune(vowels, char)
 
 		if charIsVowel {
-			// Считаем слог, если это первая гласная или предыдущий символ не был гласной
 			if !lastWasVowel || (isRussian && isYotatedVowel(char) && !isVowel(lastChar)) {
 				syllables++
 			}
 			lastWasVowel = true
 		} else {
-			// Обработка специфических случаев для русского языка
-			if isRussian {
-				// Буква 'й' может образовывать слог с предыдущей гласной
-				if char == 'й' && i > 0 && isVowel(runes[i-1]) {
-					syllables++
-				}
+			if isRussian && char == 'й' && i > 0 && isVowel(runes[i-1]) {
+				syllables++
 			}
 			lastWasVowel = false
 		}
 		lastChar = char
 	}
 
-	// Корректировка для английских слов
 	if !isRussian {
 		if strings.HasSuffix(word, "le") && len(word) > 2 && !strings.ContainsRune(vowels, rune(word[len(word)-3])) {
 			syllables++
 		}
 		if strings.HasSuffix(word, "es") || strings.HasSuffix(word, "ed") {
-			// Уменьшаем количество слогов, только если это не приводит к нулю
 			if syllables > 1 {
 				syllables--
 			}
@@ -96,14 +89,16 @@ func CountSyllables(word string) int {
 	return max(syllables, 1)
 }
 
-// CountWords подсчитывает количество слов в тексте
 func CountWords(text string) (int, []string) {
 	words := wordRegex.FindAllString(text, -1)
 	return len(words), words
 }
 
-// CountSentences подсчитывает количество предложений в тексте
 func CountSentences(text string) int {
+	// Убедимся, что текст не пуст
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
 	sentences := sentenceEndRegex.Split(strings.TrimSpace(text), -1)
 	count := 0
 	for _, s := range sentences {
@@ -114,19 +109,16 @@ func CountSentences(text string) int {
 	return count
 }
 
-// FleschKincaidIndex рассчитывает индекс Флеша-Кинкейда
 func FleschKincaidIndex(wordsCount, sentencesCount, syllablesCount float64) float64 {
 	if wordsCount == 0 || sentencesCount == 0 {
 		return 0
 	}
-	// Для очень коротких текстов делаем минимальную коррекцию, чтобы избежать слишком больших значений
 	if wordsCount < 3 || sentencesCount < 2 {
 		return 100
 	}
 	return 206.835 - 1.015*(wordsCount/sentencesCount) - 84.6*(syllablesCount/wordsCount)
 }
 
-// EstimateReadingTimeParallel оценивает время чтения текста с использованием параллельной обработки
 func EstimateReadingTimeParallel(text string, readingSpeed float64, hasVisuals bool, workerCount int) (Result, error) {
 	wordsCount, words := CountWords(text)
 	sentencesCount := CountSentences(text)
@@ -135,7 +127,6 @@ func EstimateReadingTimeParallel(text string, readingSpeed float64, hasVisuals b
 		return Result{}, errors.New("text is empty or invalid")
 	}
 
-	// Параллельный подсчет слогов
 	syllablesChan := make(chan int)
 	var wg sync.WaitGroup
 
@@ -167,7 +158,7 @@ func EstimateReadingTimeParallel(text string, readingSpeed float64, hasVisuals b
 
 	adjustedSpeed := readingSpeed
 	if fkIndex < 60 {
-		adjustedSpeed *= 0.8 // Сложный текст
+		adjustedSpeed *= 0.8
 	}
 
 	readingTime := float64(wordsCount) / adjustedSpeed
@@ -185,7 +176,6 @@ func EstimateReadingTimeParallel(text string, readingSpeed float64, hasVisuals b
 	}, nil
 }
 
-// ReadTextFromFile читает текст из файла
 func ReadTextFromFile(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -207,94 +197,117 @@ func ReadTextFromFile(filePath string) (string, error) {
 	return text.String(), nil
 }
 
-// StreamProcessFile обрабатывает текст из файла построчно, без загрузки всего файла в память
 func StreamProcessFile(filePath string, readingSpeed float64, hasVisuals bool, workerCount int) (Result, error) {
+	log.Println("Opening file:", filePath)
+
 	file, err := os.Open(filePath)
 	if err != nil {
+		log.Println("Error opening file:", err)
 		return Result{}, err
 	}
 	defer file.Close()
 
 	var (
-		totalWords       int
-		totalSentences   int
-		totalSyllables   int
-		syllablesChan    = make(chan int)
-		linesChan        = make(chan string)
-		wg               sync.WaitGroup
-		sentenceEndRegex = regexp.MustCompile(`[.!?]+`)
+		totalWords     int
+		totalSentences int
+		totalSyllables int
+		syllablesChan  = make(chan int)
+		linesChan      = make(chan string)
+		wg             sync.WaitGroup
 	)
 
 	scanner := bufio.NewScanner(file)
+	log.Println("Starting file scan")
 
 	// Параллельная обработка слогов
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
+			log.Printf("Worker %d started", workerID)
 			for line := range linesChan {
+				log.Printf("Worker %d processing line: %s", workerID, line)
+				line = strings.TrimSpace(line)
+				if line == "" {
+					log.Printf("Worker %d found an empty line, skipping", workerID)
+					continue
+				}
 				words := wordRegex.FindAllString(line, -1)
 				localSyllables := 0
 				for _, word := range words {
 					localSyllables += CountSyllables(word)
 				}
+				log.Printf("Worker %d counted %d syllables", workerID, localSyllables)
 				syllablesChan <- localSyllables
 			}
-		}()
+			log.Printf("Worker %d finished", workerID)
+		}(i)
 	}
 
 	// Подсчет слов и предложений
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
+		log.Printf("Read line: %s", line)
+		if line == "" {
+			log.Println("Skipping empty line")
+			continue
+		}
+
 		wordsInLine := wordRegex.FindAllString(line, -1)
 		totalWords += len(wordsInLine)
+		log.Printf("Total words after processing line: %d", totalWords)
 
-		// Подсчет предложений
 		sentences := sentenceEndRegex.Split(line, -1)
 		for _, s := range sentences {
 			if strings.TrimSpace(s) != "" {
 				totalSentences++
 			}
 		}
+		log.Printf("Total sentences after processing line: %d", totalSentences)
 
-		// Отправляем строку для подсчета слогов
 		linesChan <- line
 	}
 
 	if err := scanner.Err(); err != nil {
+		log.Println("Error scanning file:", err)
 		return Result{}, err
 	}
 
 	close(linesChan)
+	log.Println("Finished scanning file, waiting for workers")
 
-	// Закрываем канал подсчета слогов после завершения обработки
 	go func() {
 		wg.Wait()
 		close(syllablesChan)
 	}()
 
-	// Суммируем количество слогов
 	for syllables := range syllablesChan {
 		totalSyllables += syllables
+		log.Printf("Total syllables after worker results: %d", totalSyllables)
 	}
 
 	fkIndex := FleschKincaidIndex(float64(totalWords), float64(totalSentences), float64(totalSyllables))
+	log.Printf("Flesch-Kincaid index: %f", fkIndex)
 
 	adjustedSpeed := readingSpeed
 	if fkIndex < 60 {
 		adjustedSpeed *= 0.8
+		log.Println("Adjusting reading speed for complex text")
 	}
 
 	readingTime := float64(totalWords) / adjustedSpeed
 	if hasVisuals {
 		readingTime *= 1.1
+		log.Println("Adjusting reading time for visuals")
 	}
 
-	return Result{
+	result := Result{
 		ReadingTime:        math.Round(readingTime*100) / 100,
 		WordCount:          totalWords,
 		SentenceCount:      totalSentences,
 		SyllableCount:      totalSyllables,
 		FleschKincaidIndex: fkIndex,
-	}, nil
+	}
+	log.Printf("Final result: %+v", result)
+	return result, nil
 }
