@@ -206,3 +206,95 @@ func ReadTextFromFile(filePath string) (string, error) {
 
 	return text.String(), nil
 }
+
+// StreamProcessFile обрабатывает текст из файла построчно, без загрузки всего файла в память
+func StreamProcessFile(filePath string, readingSpeed float64, hasVisuals bool, workerCount int) (Result, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return Result{}, err
+	}
+	defer file.Close()
+
+	var (
+		totalWords       int
+		totalSentences   int
+		totalSyllables   int
+		syllablesChan    = make(chan int)
+		linesChan        = make(chan string)
+		wg               sync.WaitGroup
+		sentenceEndRegex = regexp.MustCompile(`[.!?]+`)
+	)
+
+	scanner := bufio.NewScanner(file)
+
+	// Параллельная обработка слогов
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for line := range linesChan {
+				words := wordRegex.FindAllString(line, -1)
+				localSyllables := 0
+				for _, word := range words {
+					localSyllables += CountSyllables(word)
+				}
+				syllablesChan <- localSyllables
+			}
+		}()
+	}
+
+	// Подсчет слов и предложений
+	for scanner.Scan() {
+		line := scanner.Text()
+		wordsInLine := wordRegex.FindAllString(line, -1)
+		totalWords += len(wordsInLine)
+
+		// Подсчет предложений
+		sentences := sentenceEndRegex.Split(line, -1)
+		for _, s := range sentences {
+			if strings.TrimSpace(s) != "" {
+				totalSentences++
+			}
+		}
+
+		// Отправляем строку для подсчета слогов
+		linesChan <- line
+	}
+
+	if err := scanner.Err(); err != nil {
+		return Result{}, err
+	}
+
+	close(linesChan)
+
+	// Закрываем канал подсчета слогов после завершения обработки
+	go func() {
+		wg.Wait()
+		close(syllablesChan)
+	}()
+
+	// Суммируем количество слогов
+	for syllables := range syllablesChan {
+		totalSyllables += syllables
+	}
+
+	fkIndex := FleschKincaidIndex(float64(totalWords), float64(totalSentences), float64(totalSyllables))
+
+	adjustedSpeed := readingSpeed
+	if fkIndex < 60 {
+		adjustedSpeed *= 0.8
+	}
+
+	readingTime := float64(totalWords) / adjustedSpeed
+	if hasVisuals {
+		readingTime *= 1.1
+	}
+
+	return Result{
+		ReadingTime:        math.Round(readingTime*100) / 100,
+		WordCount:          totalWords,
+		SentenceCount:      totalSentences,
+		SyllableCount:      totalSyllables,
+		FleschKincaidIndex: fkIndex,
+	}, nil
+}
